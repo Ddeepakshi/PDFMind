@@ -1,0 +1,33 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+env/
+.venv/
+.env
+
+# Docker
+*.pid
+*.log
+Dockerfile
+docker-compose.yml
+
+# Python stuff
+*.egg-info/
+*.egg
+dist/
+build/
+*.sqlite3
+
+# VSCode settings
+.vscode/
+
+# Pytest
+.cache/
+
+# OS files
+.DS_Store
+Thumbs.db
