@@ -1,9 +1,9 @@
-# main.py - FastAPI backend for RAG application (Gemini-only version)
+# main.py - Enhanced FastAPI backend for RAG application (PDF + Website support)
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from typing import List, Optional
+from pydantic import BaseModel, HttpUrl
+from typing import List, Optional, Union
 import os
 import uuid
 import asyncio
@@ -19,21 +19,27 @@ import hashlib
 from collections import Counter
 import math
 from dotenv import load_dotenv
+import aiohttp
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
+import time
+from typing import Set
 
 # Load environment variables
 load_dotenv()
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="RAG PDF Q&A API",
-    description="Backend API for RAG-based PDF question answering system (Gemini-only)",
-    version="1.0.0"
+    title="RAG PDF & Website Q&A API",
+    description="Backend API for RAG-based PDF and website question answering system",
+    version="1.1.0"
 )
 
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify your frontend URL
+    allow_origins=["http://localhost:3000"],  # In production, specify your frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -47,7 +53,7 @@ supabase: Client = create_client(
 
 # Configure Google Gemini
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-model = genai.GenerativeModel('gemini-1.5-flash')  # Use Gemini's latest model for generation
+model = genai.GenerativeModel('gemini-1.5-flash')
 embedding_model = genai.GenerativeModel('embedding-001')
 
 # Pydantic models
@@ -55,11 +61,30 @@ class QuestionRequest(BaseModel):
     question: str
     user_id: str = "anonymous"
 
+class WebsiteRequest(BaseModel):
+    url: HttpUrl
+    max_depth: int = 2  # How deep to crawl (1 = single page, 2 = page + direct links)
+    max_pages: int = 10  # Maximum pages to crawl
+    include_external_links: bool = False  # Whether to follow external links
+    user_id: str = "anonymous"
+
+class BulkWebsiteRequest(BaseModel):
+    urls: List[HttpUrl]
+    max_depth: int = 1  # For bulk, usually just single pages
+    max_pages_per_site: int = 5
+    user_id: str = "anonymous"
+
 class QuestionResponse(BaseModel):
     success: bool
     answer: str
     sources: List[dict] = []
     qa_id: Optional[int] = None
+
+class WebsiteResponse(BaseModel):
+    success: bool
+    message: str
+    documents: List[dict] = []
+    pages_processed: int = 0
 
 class HistoryResponse(BaseModel):
     success: bool
@@ -73,7 +98,229 @@ class DeleteResponse(BaseModel):
     success: bool
     message: str = ""
 
-# Helper functions
+# Website scraping utilities
+class WebsiteScraper:
+    def __init__(self):
+        self.session = None
+        self.visited_urls: Set[str] = set()
+        
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30),
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+        )
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
+    
+    async def scrape_url(self, url: str) -> dict:
+        """Scrape content from a single URL"""
+        try:
+            async with self.session.get(str(url)) as response:
+                if response.status != 200:
+                    return {"error": f"HTTP {response.status}"}
+                
+                html = await response.text()
+                soup = BeautifulSoup(html, 'html.parser')
+                
+                # Remove script and style elements
+                for script in soup(["script", "style", "nav", "header", "footer"]):
+                    script.decompose()
+                
+                # Extract title
+                title = soup.find('title')
+                title = title.get_text().strip() if title else "Untitled"
+                
+                # Extract main content
+                content = ""
+                
+                # Try to find main content areas
+                main_content = soup.find('main') or soup.find('article') or soup.find('div', class_=re.compile(r'content|main|article'))
+                if main_content:
+                    content = main_content.get_text()
+                else:
+                    # Fallback to body
+                    body = soup.find('body')
+                    if body:
+                        content = body.get_text()
+                
+                # Clean up content
+                content = re.sub(r'\s+', ' ', content).strip()
+                
+                # Extract links for potential crawling
+                links = []
+                for link in soup.find_all('a', href=True):
+                    href = link['href']
+                    full_url = urljoin(str(url), href)
+                    links.append(full_url)
+                
+                return {
+                    "url": str(url),
+                    "title": title,
+                    "content": content,
+                    "links": links,
+                    "word_count": len(content.split()),
+                    "scraped_at": datetime.now().isoformat()
+                }
+                
+        except Exception as e:
+            return {"error": str(e)}
+    
+    async def crawl_website(self, start_url: str, max_depth: int = 2, max_pages: int = 10, 
+                           include_external: bool = False) -> List[dict]:
+        """Crawl website with depth and page limits"""
+        results = []
+        to_visit = [(str(start_url), 0)]  # (url, depth)
+        base_domain = urlparse(str(start_url)).netloc
+        
+        while to_visit and len(results) < max_pages:
+            current_url, depth = to_visit.pop(0)
+            
+            if current_url in self.visited_urls or depth > max_depth:
+                continue
+                
+            self.visited_urls.add(current_url)
+            
+            # Scrape current URL
+            result = await self.scrape_url(current_url)
+            
+            if "error" not in result and result.get("content"):
+                results.append(result)
+                
+                # Add links to visit if we haven't reached max depth
+                if depth < max_depth:
+                    for link in result.get("links", []):
+                        link_domain = urlparse(link).netloc
+                        
+                        # Skip if external link and not allowed
+                        if not include_external and link_domain != base_domain:
+                            continue
+                        
+                        # Skip if already visited or queued
+                        if link not in self.visited_urls and link not in [url for url, _ in to_visit]:
+                            to_visit.append((link, depth + 1))
+            
+            # Add small delay to be respectful
+            await asyncio.sleep(0.5)
+        
+        return results
+
+# Website scraping utilities
+class WebsiteScraper:
+    def __init__(self):
+        self.session = None
+        self.visited_urls: Set[str] = set()
+        
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30),
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+        )
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
+    
+    async def scrape_url(self, url: str) -> dict:
+        """Scrape content from a single URL"""
+        try:
+            async with self.session.get(str(url)) as response:
+                if response.status != 200:
+                    return {"error": f"HTTP {response.status}"}
+                
+                html = await response.text()
+                soup = BeautifulSoup(html, 'html.parser')
+                
+                # Remove script and style elements
+                for script in soup(["script", "style", "nav", "header", "footer"]):
+                    script.decompose()
+                
+                # Extract title
+                title = soup.find('title')
+                title = title.get_text().strip() if title else "Untitled"
+                
+                # Extract main content
+                content = ""
+                
+                # Try to find main content areas
+                main_content = soup.find('main') or soup.find('article') or soup.find('div', class_=re.compile(r'content|main|article'))
+                if main_content:
+                    content = main_content.get_text()
+                else:
+                    # Fallback to body
+                    body = soup.find('body')
+                    if body:
+                        content = body.get_text()
+                
+                # Clean up content
+                content = re.sub(r'\s+', ' ', content).strip()
+                
+                # Extract links for potential crawling
+                links = []
+                for link in soup.find_all('a', href=True):
+                    href = link['href']
+                    full_url = urljoin(str(url), href)
+                    links.append(full_url)
+                
+                return {
+                    "url": str(url),
+                    "title": title,
+                    "content": content,
+                    "links": links,
+                    "word_count": len(content.split()),
+                    "scraped_at": datetime.now().isoformat()
+                }
+                
+        except Exception as e:
+            return {"error": str(e)}
+    
+    async def crawl_website(self, start_url: str, max_depth: int = 2, max_pages: int = 10, 
+                           include_external: bool = False) -> List[dict]:
+        """Crawl website with depth and page limits"""
+        results = []
+        to_visit = [(str(start_url), 0)]  # (url, depth)
+        base_domain = urlparse(str(start_url)).netloc
+        
+        while to_visit and len(results) < max_pages:
+            current_url, depth = to_visit.pop(0)
+            
+            if current_url in self.visited_urls or depth > max_depth:
+                continue
+                
+            self.visited_urls.add(current_url)
+            
+            # Scrape current URL
+            result = await self.scrape_url(current_url)
+            
+            if "error" not in result and result.get("content"):
+                results.append(result)
+                
+                # Add links to visit if we haven't reached max depth
+                if depth < max_depth:
+                    for link in result.get("links", []):
+                        link_domain = urlparse(link).netloc
+                        
+                        # Skip if external link and not allowed
+                        if not include_external and link_domain != base_domain:
+                            continue
+                        
+                        # Skip if already visited or queued
+                        if link not in self.visited_urls and link not in [url for url, _ in to_visit]:
+                            to_visit.append((link, depth + 1))
+            
+            # Add small delay to be respectful
+            await asyncio.sleep(0.5)
+        
+        return results
+
+# Helper functions (keeping existing PDF functions)
 def extract_text_from_pdf(pdf_file: bytes) -> str:
     """Extract text from PDF file"""
     try:
@@ -103,7 +350,7 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[st
         # Try to break at sentence boundaries
         if end < len(text):
             last_sentence = chunk.rfind('.')
-            if last_sentence > chunk_size * 0.5:  # Only if we don't lose too much text
+            if last_sentence > chunk_size * 0.5:
                 end = start + last_sentence + 1
                 chunk = text[start:end]
         
@@ -119,7 +366,6 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[st
 async def create_embedding(text: str) -> List[float]:
     """Create embedding using Gemini embedding model"""
     try:
-        # Use Gemini's embedding model
         result = await asyncio.to_thread(
             genai.embed_content,
             model="models/embedding-001",
@@ -128,36 +374,27 @@ async def create_embedding(text: str) -> List[float]:
         )
         return result['embedding']
     except Exception as e:
-        # Fallback to TF-IDF based embedding if Gemini embedding fails
         print(f"Gemini embedding failed: {str(e)}, using TF-IDF fallback")
         return create_tfidf_embedding(text)
 
 def create_tfidf_embedding(text: str, max_features: int = 1000) -> List[float]:
     """Create a simple TF-IDF based embedding as fallback"""
-    # Simple tokenization
     words = re.findall(r'\b\w+\b', text.lower())
-    
-    # Create word frequency vector
     word_freq = Counter(words)
     total_words = len(words)
     
-    # Get top words for vocabulary
     vocab = [word for word, _ in word_freq.most_common(min(max_features, len(word_freq)))]
     
-    # Create TF-IDF vector
     embedding = []
     for word in vocab[:max_features]:
         tf = word_freq.get(word, 0) / total_words
-        # Simple IDF approximation
         idf = math.log(1 + 1 / (word_freq.get(word, 0) + 1))
         embedding.append(tf * idf)
     
-    # Pad or truncate to fixed size
     while len(embedding) < max_features:
         embedding.append(0.0)
     embedding = embedding[:max_features]
     
-    # Normalize
     norm = math.sqrt(sum(x*x for x in embedding))
     if norm > 0:
         embedding = [x/norm for x in embedding]
@@ -180,23 +417,18 @@ async def create_query_embedding(text: str) -> List[float]:
 
 def calculate_similarity(query_embedding: List[float], doc_embeddings: List[List[float]]) -> List[float]:
     """Calculate cosine similarity between query and document embeddings"""
-    # Convert doc_embeddings to proper format if they're strings
     processed_embeddings = []
     for embedding in doc_embeddings:
         if isinstance(embedding, str):
-            # Handle string representation of numpy array
             try:
-                # Remove numpy array wrapper and convert to list
                 embedding_str = embedding.replace("np.str_('", "").replace("')", "")
                 embedding_list = [float(x) for x in embedding_str.strip('[]').split(',')]
                 processed_embeddings.append(embedding_list)
             except:
-                # If conversion fails, skip this embedding
                 continue
         elif isinstance(embedding, list):
             processed_embeddings.append(embedding)
         else:
-            # Try to convert to list
             try:
                 processed_embeddings.append(list(embedding))
             except:
@@ -213,7 +445,7 @@ def calculate_similarity(query_embedding: List[float], doc_embeddings: List[List
 async def generate_answer(question: str, context: str) -> str:
     """Generate answer using Gemini AI"""
     try:
-        prompt = f"""Based on the following context from uploaded documents, please answer the question.
+        prompt = f"""Based on the following context from uploaded documents and websites, please answer the question.
 
 Context:
 {context}
@@ -233,12 +465,36 @@ def generate_document_id() -> str:
     """Generate unique document ID"""
     return f"doc_{int(datetime.now().timestamp())}_{str(uuid.uuid4())[:8]}"
 
+async def process_chunk(doc_id: str, chunk_index: int, content: str):
+    """Process individual chunk - create embedding and store"""
+    try:
+        embedding = await create_embedding(content)
+        
+        if isinstance(embedding, str):
+            embedding = [float(x) for x in embedding.strip('[]').split(',')]
+        elif not isinstance(embedding, list):
+            embedding = list(embedding)
+        
+        chunk_data = {
+            "document_id": doc_id,
+            "chunk_index": chunk_index,
+            "content": content,
+            "embedding": embedding
+        }
+        
+        result = supabase.table("document_chunks").insert(chunk_data).execute()
+        return result.data[0] if result.data else None
+        
+    except Exception as e:
+        print(f"Error processing chunk {chunk_index}: {str(e)}")
+        return None
+
 # API Routes
 
 @app.get("/", response_model=dict)
 async def root():
     """Health check endpoint"""
-    return {"message": "RAG PDF Q&A API is running", "status": "healthy"}
+    return {"message": "RAG PDF & Website Q&A API is running", "status": "healthy"}
 
 @app.post("/api/upload", response_model=dict)
 async def upload_pdfs(files: List[UploadFile] = File(...)):
@@ -250,25 +506,20 @@ async def upload_pdfs(files: List[UploadFile] = File(...)):
             if not file.content_type == "application/pdf":
                 continue
                 
-            # Read file content
             content = await file.read()
-            
-            # Extract text from PDF
             text = extract_text_from_pdf(content)
             
             if not text.strip():
                 continue
                 
-            # Create text chunks
             chunks = chunk_text(text)
-            
-            # Generate document ID
             doc_id = generate_document_id()
             
-            # Store document metadata
             doc_data = {
                 "id": doc_id,
                 "filename": file.filename,
+                "source_type": "pdf",
+                "source_url": None,
                 "upload_date": datetime.now().isoformat(),
                 "total_chunks": len(chunks)
             }
@@ -277,12 +528,11 @@ async def upload_pdfs(files: List[UploadFile] = File(...)):
             if not result.data:
                 raise HTTPException(status_code=500, detail="Failed to store document metadata")
             
-            # Process chunks and create embeddings
+            # Process chunks
             chunk_tasks = []
             for i, chunk in enumerate(chunks):
                 chunk_tasks.append(process_chunk(doc_id, i, chunk))
             
-            # Process chunks concurrently (but limit concurrency to avoid rate limits)
             chunk_results = []
             batch_size = 5
             for i in range(0, len(chunk_tasks), batch_size):
@@ -297,33 +547,277 @@ async def upload_pdfs(files: List[UploadFile] = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
-async def process_chunk(doc_id: str, chunk_index: int, content: str):
-    """Process individual chunk - create embedding and store"""
+@app.post("/api/website", response_model=WebsiteResponse)
+async def scrape_website(request: WebsiteRequest):
+    """Scrape and process a website"""
     try:
-        # Create embedding
-        embedding = await create_embedding(content)
+        async with WebsiteScraper() as scraper:
+            # Crawl the website
+            scraped_pages = await scraper.crawl_website(
+                str(request.url), 
+                request.max_depth, 
+                request.max_pages,
+                request.include_external_links
+            )
+            
+            if not scraped_pages:
+                raise HTTPException(status_code=400, detail="No content could be extracted from the website")
+            
+            processed_docs = []
+            
+            for page in scraped_pages:
+                if not page.get("content"):
+                    continue
+                
+                # Create chunks from page content
+                chunks = chunk_text(page["content"])
+                doc_id = generate_document_id()
+                
+                # Store document metadata
+                doc_data = {
+                    "id": doc_id,
+                    "filename": page["title"],
+                    "source_type": "website",
+                    "source_url": page["url"],
+                    "upload_date": datetime.now().isoformat(),
+                    "total_chunks": len(chunks),
+                    "metadata": {
+                        "word_count": page.get("word_count", 0),
+                        "scraped_at": page.get("scraped_at")
+                    }
+                }
+                
+                result = supabase.table("documents").insert(doc_data).execute()
+                if not result.data:
+                    continue
+                
+                # Process chunks
+                chunk_tasks = []
+                for i, chunk in enumerate(chunks):
+                    chunk_tasks.append(process_chunk(doc_id, i, chunk))
+                
+                # Process chunks in batches
+                batch_size = 5
+                for i in range(0, len(chunk_tasks), batch_size):
+                    batch = chunk_tasks[i:i + batch_size]
+                    await asyncio.gather(*batch)
+                
+                processed_docs.append(result.data[0])
+            
+            return WebsiteResponse(
+                success=True,
+                message=f"Successfully processed {len(processed_docs)} pages from the website",
+                documents=processed_docs,
+                pages_processed=len(processed_docs)
+            )
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Website scraping failed: {str(e)}")
+
+@app.post("/api/websites/bulk", response_model=WebsiteResponse)
+async def scrape_multiple_websites(request: BulkWebsiteRequest):
+    """Scrape multiple websites"""
+    try:
+        all_processed_docs = []
+        total_pages = 0
         
-        # Ensure embedding is a proper list of floats
-        if isinstance(embedding, str):
-            # Convert string to list if needed
-            embedding = [float(x) for x in embedding.strip('[]').split(',')]
-        elif not isinstance(embedding, list):
-            embedding = list(embedding)
+        async with WebsiteScraper() as scraper:
+            for url in request.urls:
+                try:
+                    # Scrape each website
+                    scraped_pages = await scraper.crawl_website(
+                        str(url), 
+                        request.max_depth, 
+                        request.max_pages_per_site,
+                        False  # Don't follow external links for bulk processing
+                    )
+                    
+                    for page in scraped_pages:
+                        if not page.get("content"):
+                            continue
+                        
+                        chunks = chunk_text(page["content"])
+                        doc_id = generate_document_id()
+                        
+                        doc_data = {
+                            "id": doc_id,
+                            "filename": page["title"],
+                            "source_type": "website",
+                            "source_url": page["url"],
+                            "upload_date": datetime.now().isoformat(),
+                            "total_chunks": len(chunks),
+                            "metadata": {
+                                "word_count": page.get("word_count", 0),
+                                "scraped_at": page.get("scraped_at")
+                            }
+                        }
+                        
+                        result = supabase.table("documents").insert(doc_data).execute()
+                        if not result.data:
+                            continue
+                        
+                        # Process chunks
+                        chunk_tasks = []
+                        for i, chunk in enumerate(chunks):
+                            chunk_tasks.append(process_chunk(doc_id, i, chunk))
+                        
+                        batch_size = 5
+                        for i in range(0, len(chunk_tasks), batch_size):
+                            batch = chunk_tasks[i:i + batch_size]
+                            await asyncio.gather(*batch)
+                        
+                        all_processed_docs.append(result.data[0])
+                        total_pages += 1
+                
+                except Exception as e:
+                    print(f"Error processing {url}: {str(e)}")
+                    continue
         
-        # Store chunk with embedding
-        chunk_data = {
-            "document_id": doc_id,
-            "chunk_index": chunk_index,
-            "content": content,
-            "embedding": embedding  # This should now be a proper list
-        }
-        
-        result = supabase.table("document_chunks").insert(chunk_data).execute()
-        return result.data[0] if result.data else None
+        return WebsiteResponse(
+            success=True,
+            message=f"Successfully processed {total_pages} pages from {len(request.urls)} websites",
+            documents=all_processed_docs,
+            pages_processed=total_pages
+        )
         
     except Exception as e:
-        print(f"Error processing chunk {chunk_index}: {str(e)}")
-        return None
+        raise HTTPException(status_code=500, detail=f"Bulk website scraping failed: {str(e)}")
+
+@app.post("/api/website", response_model=WebsiteResponse)
+async def scrape_website(request: WebsiteRequest):
+    """Scrape and process a website"""
+    try:
+        async with WebsiteScraper() as scraper:
+            # Crawl the website
+            scraped_pages = await scraper.crawl_website(
+                str(request.url), 
+                request.max_depth, 
+                request.max_pages,
+                request.include_external_links
+            )
+            
+            if not scraped_pages:
+                raise HTTPException(status_code=400, detail="No content could be extracted from the website")
+            
+            processed_docs = []
+            
+            for page in scraped_pages:
+                if not page.get("content"):
+                    continue
+                
+                # Create chunks from page content
+                chunks = chunk_text(page["content"])
+                doc_id = generate_document_id()
+                
+                # Store document metadata
+                doc_data = {
+                    "id": doc_id,
+                    "filename": page["title"],
+                    "source_type": "website",
+                    "source_url": page["url"],
+                    "upload_date": datetime.now().isoformat(),
+                    "total_chunks": len(chunks),
+                    "metadata": {
+                        "word_count": page.get("word_count", 0),
+                        "scraped_at": page.get("scraped_at")
+                    }
+                }
+                
+                result = supabase.table("documents").insert(doc_data).execute()
+                if not result.data:
+                    continue
+                
+                # Process chunks
+                chunk_tasks = []
+                for i, chunk in enumerate(chunks):
+                    chunk_tasks.append(process_chunk(doc_id, i, chunk))
+                
+                # Process chunks in batches
+                batch_size = 5
+                for i in range(0, len(chunk_tasks), batch_size):
+                    batch = chunk_tasks[i:i + batch_size]
+                    await asyncio.gather(*batch)
+                
+                processed_docs.append(result.data[0])
+            
+            return WebsiteResponse(
+                success=True,
+                message=f"Successfully processed {len(processed_docs)} pages from the website",
+                documents=processed_docs,
+                pages_processed=len(processed_docs)
+            )
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Website scraping failed: {str(e)}")
+
+@app.post("/api/websites/bulk", response_model=WebsiteResponse)
+async def scrape_multiple_websites(request: BulkWebsiteRequest):
+    """Scrape multiple websites"""
+    try:
+        all_processed_docs = []
+        total_pages = 0
+        
+        async with WebsiteScraper() as scraper:
+            for url in request.urls:
+                try:
+                    # Scrape each website
+                    scraped_pages = await scraper.crawl_website(
+                        str(url), 
+                        request.max_depth, 
+                        request.max_pages_per_site,
+                        False  # Don't follow external links for bulk processing
+                    )
+                    
+                    for page in scraped_pages:
+                        if not page.get("content"):
+                            continue
+                        
+                        chunks = chunk_text(page["content"])
+                        doc_id = generate_document_id()
+                        
+                        doc_data = {
+                            "id": doc_id,
+                            "filename": page["title"],
+                            "source_type": "website",
+                            "source_url": page["url"],
+                            "upload_date": datetime.now().isoformat(),
+                            "total_chunks": len(chunks),
+                            "metadata": {
+                                "word_count": page.get("word_count", 0),
+                                "scraped_at": page.get("scraped_at")
+                            }
+                        }
+                        
+                        result = supabase.table("documents").insert(doc_data).execute()
+                        if not result.data:
+                            continue
+                        
+                        # Process chunks
+                        chunk_tasks = []
+                        for i, chunk in enumerate(chunks):
+                            chunk_tasks.append(process_chunk(doc_id, i, chunk))
+                        
+                        batch_size = 5
+                        for i in range(0, len(chunk_tasks), batch_size):
+                            batch = chunk_tasks[i:i + batch_size]
+                            await asyncio.gather(*batch)
+                        
+                        all_processed_docs.append(result.data[0])
+                        total_pages += 1
+                
+                except Exception as e:
+                    print(f"Error processing {url}: {str(e)}")
+                    continue
+        
+        return WebsiteResponse(
+            success=True,
+            message=f"Successfully processed {total_pages} pages from {len(request.urls)} websites",
+            documents=all_processed_docs,
+            pages_processed=total_pages
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Bulk website scraping failed: {str(e)}")
 
 @app.post("/api/ask", response_model=QuestionResponse)
 async def ask_question(request: QuestionRequest):
@@ -334,7 +828,7 @@ async def ask_question(request: QuestionRequest):
         
         # Retrieve all document chunks with embeddings
         result = supabase.table("document_chunks").select(
-            "*, documents(filename)"
+            "*, documents(filename, source_type, source_url)"
         ).execute()
         
         if not result.data:
@@ -354,9 +848,17 @@ async def ask_question(request: QuestionRequest):
         sources = []
         
         for chunk, similarity in top_chunks:
-            context_parts.append(f"Document: {chunk['documents']['filename']}\nContent: {chunk['content']}")
+            doc = chunk['documents']
+            if doc['source_type'] == 'pdf':
+                source_info = f"PDF: {doc['filename']}"
+            else:
+                source_info = f"Website: {doc['filename']} ({doc['source_url']})"
+            
+            context_parts.append(f"Source: {source_info}\nContent: {chunk['content']}")
             sources.append({
-                "filename": chunk['documents']['filename'],
+                "filename": doc['filename'],
+                "source_type": doc['source_type'],
+                "source_url": doc['source_url'],
                 "similarity": round(float(similarity), 3)
             })
         
@@ -451,9 +953,12 @@ async def clear_history(user_id: str):
 async def get_stats():
     """Get application statistics"""
     try:
-        # Get document count
-        doc_result = supabase.table("documents").select("id", count="exact").execute()
-        doc_count = doc_result.count or 0
+        # Get document counts by type
+        doc_result = supabase.table("documents").select("source_type").execute()
+        docs = doc_result.data or []
+        
+        pdf_count = len([d for d in docs if d.get("source_type") == "pdf"])
+        website_count = len([d for d in docs if d.get("source_type") == "website"])
         
         # Get chunk count
         chunk_result = supabase.table("document_chunks").select("id", count="exact").execute()
@@ -466,7 +971,9 @@ async def get_stats():
         return {
             "success": True,
             "stats": {
-                "total_documents": doc_count,
+                "total_documents": len(docs),
+                "pdf_documents": pdf_count,
+                "website_documents": website_count,
                 "total_chunks": chunk_count,
                 "total_questions": qa_count
             }
@@ -477,6 +984,4 @@ async def get_stats():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app,reload=True)
-
-
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)

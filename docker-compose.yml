@@ -7,12 +7,14 @@ services:
       - "8000:8000"
     volumes:
       - ./backend:/app
-  
+
   frontend:
     build:
-      context: ./frontend/rag-frontend
+      context: ./rag-frontend
       dockerfile: Dockerfile
     ports:
       - "3000:3000"
     volumes:
-      - ./frontend/rag-frontend:/app
+      - ./rag-frontend:/app
+    depends_on:
+      - backend
